@@ -12,6 +12,8 @@
             [tech.ml.utils :as ml-utils]
             [tech.ml.loss :as loss]
             [tech.datatype :as dtype]
+            [clj-ml-wkg.tablesaw :as saw]
+            [clj-ml-wkg.util :refer [checknan]]
             [oz.core :as oz]
             )
   (:import [tech.tablesaw.api Table ColumnType
@@ -25,190 +27,28 @@
 (set! *warn-on-reflection* true)
 (set! *unchecked-math* :warn-on-boxed)
 
-
-
-(defn ^tech.tablesaw.io.csv.CsvReadOptions$Builder
-  ->csv-builder [^String path & {:keys [separator header? date-format]}]
-  (if separator
-    (doto (CsvReadOptions/builder path)
-      (.separator separator)
-      (.header (boolean header?)))
-    (doto (CsvReadOptions/builder path)
-      (.header (boolean header?)))))
-
-
-(defn ->table
-  ^Table [path & {:keys [separator quote]}]
-  (-> (Table/read)
-      (.csv (->csv-builder path :separator separator :header? true))))
-
-
 (def load-dataset
   (memoize
-   #(->table "data/aimes-house-prices/train.csv")))
-
-
-(defn ->column-seq
-  [item]
-  (if (instance? Table item)
-    (.columns ^Table item)
-    (seq item)))
-
-
-
-(defn column->seq
-  [^Column col]
-  (->> (.asList col)
-       seq))
-
-
-(defn column->unique-set
-  [^Column col]
-  (->> (.unique col)
-       (.asList)
-       set))
-
-
-(defn column->metadata
-  [^Column col]
-  (let [num-unique (.countUnique col)]
-    (merge
-     {:name (.name col)
-      :type (->kebab-case (.name (.type col)))
-      :size (.size col)
-      :num-missing (.countMissing col)
-      :num-unique num-unique
-      })))
-
-
-(defn column-name
-  [^Column item]
-  (.name item))
-
-
-(defn col-seq->map
-  [col-seq]
-  (->> (->column-seq col-seq)
-       (map (juxt column-name identity))
-       (into {})))
-
-
-(defn update-column
-  [dataset column-name f & args]
-  (let [new-map (apply update (col-seq->map dataset) column-name f args)]
-    (->> (->column-seq dataset)
-         (map (comp #(get new-map %) #(.name ^Column %))))))
-
-
-(defn column-double-op
-  [dataset column-name double-fn]
-  (update-column
-   dataset column-name
-   (fn [^Column col]
-     (let [^DoubleColumn double-col (.asDoubleColumn ^NumericColumn col)]
-       (parallel/parallel-for
-        idx (.size double-col)
-        (.set double-col idx
-              (double (double-fn (.getDouble double-col idx)))))
-       double-col))))
-
-
-(defn log1p
-  [col-name dataset]
-  (column-double-op dataset col-name #(Math/log (+ 1.0 (double %)))))
-
-
-(defn numeric-missing?
-  [dataset]
-  (->> (->column-seq dataset)
-       (filter #(and (instance? NumericColumn %)
-                     (> (.countMissing ^Column %) 0)))))
-
-
-(defn non-numeric-missing?
-  [dataset]
-  (->> (->column-seq dataset)
-       (filter #(and (not (instance? NumericColumn %))
-                     (> (.countMissing ^Column %) 0)))))
-
-
-(defn col-map
-  [map-fn & args]
-  (apply map map-fn (map ->column-seq args)))
-
-
-(defn update-strings
-  [str-fn dataset]
-  (col-map (fn [^Column col]
-             (if (= "string" (:type (column->metadata col)))
-                (let [^"[Ljava.lang.String;" str-data (make-array String (.size col))]
-                  (parallel/parallel-for
-                   idx (.size col)
-                   (aset str-data idx (str (str-fn (.getString ^StringColumn col idx)))))
-                  (StringColumn/create (.name col) str-data))
-                col))
-           dataset))
-
-(def col-type->datatype-map
-  {"short" :int16
-   "integer" :int32})
-
-(defn col-datatype-cast
-  [data-val ^Column column]
-  (let [column-dtype-name (-> column
-                              (.type)
-                              (.name)
-                              ->kebab-case)]
-    (if-let [dtype (get col-type->datatype-map column-dtype-name)]
-      (dtype/cast data-val dtype)
-      (throw (ex-info "Failed to map numeric datatype to datatype library"
-                      {:column-type column-dtype-name})))))
-
-(defn update-numeric-missing
-  [num-val dataset]
-  (col-map (fn [^Column col]
-             (if (and (instance? NumericColumn col)
-                      (> (.countMissing col) 0))
-               (let [new-col (.copy col)
-                     ^ints missing-data (.toArray (.isMissing new-col))]
-                 (parallel/parallel-for
-                  idx (alength missing-data)
-                  (.set new-col
-                        (aget missing-data idx)
-                        (col-datatype-cast (long num-val) col)))
-                 new-col)
-               col))
-           dataset))
-
+   #(saw/->table "data/aimes-house-prices/train.csv")))
 
 (defn load-aimes-dataset
   []
   (->> (load-dataset)
-       (update-strings #(if (= "" %)
+       (saw/update-strings #(if (= "" %)
                           "NA"
                           %))
        ;;There are only three columns that are numeric and have missing data.
        ;;Looking at the descriptions, 0 makes more sense than the column-median.
-       (update-numeric-missing 0)
-       (log1p "SalePrice")))
-
+       (saw/update-numeric-missing 0)
+       (saw/log1p "SalePrice")))
 
 ;;numeric columns that should be string columns
 (def categorical-column-names
   #{"MSSubClass" "OverallQual" "OverallCond"})
 
-
 (defn ->keyword-name
   [^String val]
   (keyword (->kebab-case val)))
-
-
-(defn- get-column
-  ^Column [column-map entry-kwd]
-  (if-let [retval (get column-map entry-kwd)]
-    (:column retval)
-    (throw (ex-info (format "Failed to find column %s" entry-kwd)
-                    {:columns (set (keys column-map))}))))
 
 
 (def aimes-column-names #{"PoolQC"
@@ -295,34 +135,7 @@
 
 
 (def feature-names (c-set/difference aimes-column-names #{"Id" "SalePrice"}))
-
 (def label-name "SalePrice")
-
-
-(defn- checknan
-  ^double [col-kwd row-idx item]
-  (let [retval (double item)]
-    (when (Double/isNaN retval)
-      (throw (ex-info (format "NAN detected in column: %s[%s]" col-kwd row-idx) {})))
-    retval))
-
-
-(defn set-string-table
-  ^StringColumn [^StringColumn column str-table]
-  (when-not (= (column->unique-set column)
-               (set (keys str-table)))
-    (throw (ex-info "String table keys existing unique set mismatch"
-                    {:str-table-keys (set (keys str-table))
-                     :column-unique-set (column->unique-set column)})))
-  (let [new-str-table (StringColumn/create (.name column))]
-    ;;uggh.  Create the appropriate type for the size of the unique-set
-    ;;and build the forward/reverse mappings.
-    ;;Then set all the values and you should have it.
-    )
-
-  )
-
-
 
 ;; Tech datasets are essentially row store.
 ;; Coalesced datasets are dense vectors of data
@@ -361,7 +174,7 @@
         label-name (->keyword-name label-name)
         n-features (count feature-names)
         col-getter-fn (fn [col-kwd]
-                        (let [column (get-column column-map col-kwd)
+                        (let [column (saw/get-column column-map col-kwd)
                               label-entry (get label-map col-kwd)]
                           (if label-entry
                             (fn [row-idx]
