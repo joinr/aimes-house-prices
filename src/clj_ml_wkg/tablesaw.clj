@@ -4,7 +4,8 @@
 (ns clj-ml-wkg.tablesaw
   (:require [clj-ml-wkg.util :refer [checknan]])
   (:import [tech.tablesaw.api Table ColumnType
-            NumericColumn DoubleColumn
+            NumericColumn DoubleColumn ShortColumn
+            LongColumn IntColumn
             StringColumn BooleanColumn]
            [tech.tablesaw.columns Column]
            [tech.tablesaw.io.csv CsvReadOptions]
@@ -20,12 +21,150 @@
 (defprotocol IColumn
   (column-name [c])
   (column-type [c])
+  ;;maybe change to column-size?
   (entry-count [c] "This is lame, wish we had ICounted..."))
+
+;;more to follow...
+(defprotocol IDestructiveColumnOps
+  (map-column! [col f]))
+
+;;these may be redundant - we have analogues in Counted and
+;;Named, but for now we'll astronaut architect a tad...
+(defprotocol IColumnType
+  (-type-name [this]
+    "Allows for columns to declare types for efficiency.")
+  (-byte-size [this]
+    "Columns types can communicate their entry size, for portability."))
+
+(extend-protocol IColumnType
+  ColumnType
+  (-type-name [t] (.name t))
+  (-byte-size [t] (.byteSize t)))
+
+;;THis is a poor guess...todo - verify
+(def ^:const +object-size+ 16)
+
+(defprotocol IColumnEntries
+  (entries [c] "Return an ordered collection of entries from the column."))
 
 ;;allow foreign types to implement efficient operations
 ;;with a seq-based fallback option.
 (defprotocol IUnique
-  (-unique [c]))
+  (-unique-set [c]
+    "column implements efficient operations to compute a set from entries" )
+  (-unique-count [c]
+    "column implements efficient operations to count unique elements"))
+
+(defprotocol IMissing
+  (-missing-count [c]
+    "Column implements efficient operations to count missing elements."))
+
+(defn column->unique-set
+  [^Column col]
+  (->> (.unique col)
+       (.asList)
+       set))
+
+(defn column->seq
+  [^Column col]
+  (->> (.asList col)
+       seq))
+
+(defn column->unique-count [^Column col]
+  (.uniqueCount col))
+
+
+(defn map-column [col f]
+  (parallel/parallel-for idx (entry-count double-col)
+    (.set double-col idx
+          (double (double-fn (.getDouble double-col idx))))))
+
+(def +types+ {"DOUBLE"  "Double"
+              "LONG"    "Long"
+              "SHORT"   "Short"
+              "INTEGER" ["Integer" "IntColumn"]
+              "FLOAT"   "Float"
+              "BOOLEAN" "Boolean"
+              "STRING"  "String"})
+
+(def cols (for [t types]
+            (let [[t ]
+                  upped (str (clojure.string/upper-case (subs t 0 1))
+                             (clojure.string/lower-case (subs 1 t)))]
+              {:getter (symbol (str "get" upped "."))
+               :type   (symbol (str upped "Column"))})))
+
+(defmacro for-column [col type f]
+  (let [getter (symbol (get getters type "getObject."))]
+    (parallel/parallel-for idx (entry-count double-col)
+    (.set double-col idx
+          (double (double-fn (.getDouble double-col idx)))))))
+
+;;wrapper to help us out here...could use macrology to
+;;make this simpler....are there a set of base operations
+;;we can use to define appropriate wrappers?
+(deftype tablesaw-column [^Column col]
+  IColumn
+  (column-name [c]     (.name col))
+  (column-type [c]     (.type col))
+  (entry-count [c]     (.count col))
+  IColumnEntries  ;;maybe revisit? could also cache.
+  (entries [c] (vec (.asList col)))
+  IUnique
+  (-unique-set   [c] (column->unique-set col)) ;;could cache this.
+  (-unique-count [c] (column->unique-count col))
+  IMissing
+  (-missing-count [c] (.countMissing col))
+  IColumnOps
+  (map-column [c f]
+    (case (-type-name (column-type c))
+      "DOUBLE"
+      "SINGLE"
+      "LONG"
+      "SHORT"
+      "INTEGER"
+      "FLOAT"
+      "BOOLEAN"
+      "STRING")
+    )
+  ;;convenience functions.
+  clojure.lang.IFn
+  (invoke [this row-index]
+    (.get this (int row-index)))
+  clojure.lang.Seqable
+  (seq [this] (column->seq col)))
+
+;;protocol-derived API
+;;todo: 2x that this is a decent default...
+(defn type-name [ct]
+  (if (extends? IColumnType (type ct))
+    (-type-name ct)
+    "object"))
+
+(defn type-size [ct]
+  (if (extends? IColumnType (type ct))
+    (-byte-size ct)
+    +object-size+))
+
+(defn count-unique [col]
+  (if (extends? IUnique (type col))
+    (-unique-count col)
+    (-> col entries distinct count)))
+
+(defn count-missing [col]
+  (if (extends? protocol IMissing (type col))
+    (-missing-count col)
+    (->> col entries (filter (complement identity)) count)))
+
+;;todo count-missing-by, missing-by?, missing, etc.
+
+(defn uniques [col]
+  (if (extends? IUnique (type col))
+    (-unique-set col)
+    (-> col entries distinct)))
+
+(defn missing    [col])
+(defn missing-by [keyf col])
 
 
 (defn ^tech.tablesaw.io.csv.CsvReadOptions$Builder
@@ -37,59 +176,41 @@
     (doto (CsvReadOptions/builder path)
       (.header (boolean header?)))))
 
-
 (defn ->table
   ^Table [path & {:keys [separator quote]}]
   (-> (Table/read)
       (.csv (->csv-builder path :separator separator :header? true))))
 
-;;seems like a protocol function...
-(defn ->column-seq
-  [item]
-  (if #_(instance? Table item)
-      (extends? )
-    (columns item)
-    (seq item)))
-
-;;doesn't appear to be used at the moment.
-(defn column->seq
-  [^Column col]
-  (->> (.asList col)
-       seq))
-
-(defn column->unique-set
-  [^Column col]
-  (->> (.unique col)
-       (.asList)
-       set))
-
+;;todo Revisit this.  I eliminated seeming redundant merge.
 (defn column->metadata
-  [^Column col]
-  (let [num-unique (.countUnique col)]
-    (merge
-     {:name (.name col)
-      :type (->kebab-case (.name (.type col)))
-      :size (.size col)
-      :num-missing (.countMissing col)
-      :num-unique num-unique
-      })))
+  [col]
+  {:name (column-name col)
+   :type (-> col column-type type-name ->kebab-case)
+   :size (entry-count col)
+   :num-missing (count-missing col)
+   :num-unique  (count-unique col)})
 
 
-(defn column-name
+;;deprecated
+#_(defn column-name
   [^Column item]
   (.name item))
 
 (defn col-seq->map
   [col-seq]
-  (->> (->column-seq col-seq)
+  (->> (columns col-seq)
        (map (juxt column-name identity))
        (into {})))
 
 (defn update-column
   [dataset column-name f & args]
   (let [new-map (apply update (col-seq->map dataset) column-name f args)]
-    (->> (->column-seq dataset)
-         (map (comp #(get new-map %) #(.name ^Column %))))))
+    (->> (columns dataset)
+         (map (comp #(get new-map %) column-name)))))
+
+;;given double-col -> getDouble
+;;given type -> (.set blah idx (double (fn  ... (.getType))))
+
 
 (defn column-double-op
   [dataset column-name double-fn]
@@ -98,7 +219,7 @@
    (fn [^Column col]
      (let [^DoubleColumn double-col (.asDoubleColumn ^NumericColumn col)]
        (parallel/parallel-for
-        idx (.size double-col)
+        idx (entry-count double-col)
         (.set double-col idx
               (double (double-fn (.getDouble double-col idx)))))
        double-col))))
@@ -109,19 +230,19 @@
 
 (defn numeric-missing?
   [dataset]
-  (->> (->column-seq dataset)
+  (->> (columns dataset)
        (filter #(and (instance? NumericColumn %)
                      (> (.countMissing ^Column %) 0)))))
 
 (defn non-numeric-missing?
   [dataset]
-  (->> (->column-seq dataset)
+  (->> (columns dataset)
        (filter #(and (not (instance? NumericColumn %))
                      (> (.countMissing ^Column %) 0)))))
 
 (defn col-map
   [map-fn & args]
-  (apply map map-fn (map ->column-seq args)))
+  (apply map map-fn (map columns args)))
 
 (defn update-strings
   [str-fn dataset]
@@ -220,7 +341,7 @@
 
 (defn ->tech-ml-dataset
   [{:keys [label-map] :as options} dataset]
-  (let [column-map (->> (->column-seq dataset)
+  (let [column-map (->> (columns dataset)
                         (map (fn [^Column col]
                                (let [col-name (->keyword-name (.name col))]
                                  [col-name (-> (column->metadata col)
@@ -237,7 +358,7 @@
                               (into {}))
                          ;;Allow users to override string->int mapping
                          label-map)
-        column-sizes (->> (->column-seq dataset)
+        column-sizes (->> (columns dataset)
                           (map #(.size ^Column %))
                           distinct)
 
@@ -283,3 +404,10 @@
                                                  feature-names
                                                  key-ecount-map
                                                  [label-name]))))
+
+
+;;deprecated for columns
+#_(defn columns  [item]
+    (if (extends? IColumnar (type item))
+      (columns item)
+      (seq item)))
